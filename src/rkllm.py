@@ -1,4 +1,6 @@
 import ctypes
+import os
+import psutil
 from .classes import *
 from .callback import *
 
@@ -8,7 +10,7 @@ callback = callback_type(callback_impl)
 
 # Définir la classe RKLLM, qui inclut l'initialisation, l'inférence et les opérations de libération pour le modèle RKLLM dans la bibliothèque dynamique
 class RKLLM(object):
-    def __init__(self, model_path, lora_model_path = None, prompt_cache_path = None):
+    def __init__(self, model_path, lora_model_path = None, prompt_cache_path = None, max_context_len=None):
         
         self.format_schema = None
         self.format_type = None
@@ -17,7 +19,11 @@ class RKLLM(object):
         rkllm_param = RKLLMParam()
         rkllm_param.model_path = bytes(model_path, 'utf-8')
 
-        rkllm_param.max_context_len = 1024
+        # Estimate max context length if not specified
+        if max_context_len is None:
+            max_context_len = self.estimate_max_context_length(model_path)
+            
+        rkllm_param.max_context_len = max_context_len
         rkllm_param.max_new_tokens = -1
         rkllm_param.skip_special_token = True
 
@@ -80,6 +86,56 @@ class RKLLM(object):
             rkllm_load_prompt_cache.argtypes = [RKLLM_Handle_t, ctypes.c_char_p]
             rkllm_load_prompt_cache.restype = ctypes.c_int
             rkllm_load_prompt_cache(self.handle, ctypes.c_char_p((prompt_cache_path).encode('utf-8')))
+
+    def estimate_max_context_length(self, model_path):
+        """
+        Estimate the maximum context length based on model size and available memory.
+        
+        Returns:
+            int: Estimated maximum context length
+        """
+        # Get available system memory in GB
+        available_memory_gb = psutil.virtual_memory().available / (1024 * 1024 * 1024)
+        
+        # Conservative estimate - reserve memory for the model and other processes
+        # Typically LLMs use 1-2 bytes per token per parameter for inference
+        # Start with some defaults based on model path
+        
+        # Extract model type/size from path if possible
+        model_name = os.path.basename(model_path).lower()
+        
+        # Default values
+        token_memory_factor = 16  # bytes per token per position (conservative estimate)
+        safety_factor = 0.7  # Only use 70% of available memory
+        
+        # Adjust based on model size if we can detect it
+        if "7b" in model_name:
+            base_memory = 14  # GB (approximate model size)
+        elif "13b" in model_name:
+            base_memory = 26  # GB
+            token_memory_factor = 20  # Larger models have higher memory per token
+        elif "70b" in model_name:
+            base_memory = 140  # GB
+            token_memory_factor = 32
+            safety_factor = 0.6  # Be more conservative with larger models
+        else:
+            # Default guess for unknown model
+            base_memory = 10  # GB
+        
+        # Calculate usable memory
+        usable_memory_gb = max(0, available_memory_gb - base_memory) * safety_factor
+        
+        # Convert to tokens
+        estimated_max_tokens = int((usable_memory_gb * 1024 * 1024 * 1024) / token_memory_factor)
+        
+        # Cap at reasonable values
+        estimated_max_tokens = max(1024, min(32768, estimated_max_tokens))
+        
+        # Round to nearest 1024
+        estimated_max_tokens = (estimated_max_tokens // 1024) * 1024
+        
+        print(f"Estimated maximum context length: {estimated_max_tokens} tokens")
+        return estimated_max_tokens
 
     def tokens_to_ctypes_array(self, tokens, ctype):
         return (ctype * len(tokens))(*tokens)
