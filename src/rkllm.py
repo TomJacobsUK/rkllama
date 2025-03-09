@@ -1,6 +1,7 @@
 import ctypes
 import os
 import psutil
+import re
 from .classes import *
 from .callback import *
 
@@ -90,51 +91,92 @@ class RKLLM(object):
     def estimate_max_context_length(self, model_path):
         """
         Estimate the maximum context length based on model size and available memory.
+        Optimized for embedded systems like RK3588 with limited RAM.
         
         Returns:
             int: Estimated maximum context length
         """
         # Get available system memory in GB
         available_memory_gb = psutil.virtual_memory().available / (1024 * 1024 * 1024)
+        total_memory_gb = psutil.virtual_memory().total / (1024 * 1024 * 1024)
         
-        # Conservative estimate - reserve memory for the model and other processes
-        # Typically LLMs use 1-2 bytes per token per parameter for inference
-        # Start with some defaults based on model path
+        print(f"System memory: {total_memory_gb:.2f} GB total, {available_memory_gb:.2f} GB available")
         
         # Extract model type/size from path if possible
         model_name = os.path.basename(model_path).lower()
         
-        # Default values
-        token_memory_factor = 16  # bytes per token per position (conservative estimate)
-        safety_factor = 0.7  # Only use 70% of available memory
+        # Try to extract model size using regex (e.g., 7b, 3b, 1.5b, etc.)
+        model_size_match = re.search(r'(\d+(\.\d+)?)[bB]', model_name)
+        model_size_gb = None
         
-        # Adjust based on model size if we can detect it
-        if "7b" in model_name:
-            base_memory = 14  # GB (approximate model size)
-        elif "13b" in model_name:
-            base_memory = 26  # GB
-            token_memory_factor = 20  # Larger models have higher memory per token
-        elif "70b" in model_name:
-            base_memory = 140  # GB
-            token_memory_factor = 32
-            safety_factor = 0.6  # Be more conservative with larger models
+        if model_size_match:
+            size_in_b = float(model_size_match.group(1))
+            # Rough estimation of model size in GB based on parameters
+            # ~2 bytes per parameter for quantized models (4 bytes for FP32)
+            model_size_gb = size_in_b * 2 / 1.0  # Assuming some level of quantization
+        
+        # Default values - more conservative for embedded devices
+        token_memory_factor = 12  # bytes per token per position (initial conservative estimate)
+        safety_factor = 0.6  # Lower safety factor for embedded systems
+        
+        # Adjust based on detected model size or use defaults
+        if model_size_match:
+            size_in_b = float(model_size_match.group(1))
+            
+            # Adjust parameters based on model size
+            if size_in_b <= 1:
+                base_memory = 2  # GB (approximate model size for 1B models)
+                token_memory_factor = 8
+            elif size_in_b <= 2:
+                base_memory = 4  # GB
+                token_memory_factor = 10
+            elif size_in_b <= 3:
+                base_memory = 6  # GB 
+                token_memory_factor = 12
+            elif size_in_b <= 7:
+                base_memory = 14  # GB
+            elif size_in_b <= 13:
+                base_memory = 26  # GB
+                token_memory_factor = 18
+            elif size_in_b <= 34:
+                base_memory = 68  # GB
+                token_memory_factor = 24
+                safety_factor = 0.5
+            else:
+                base_memory = 140  # GB
+                token_memory_factor = 32
+                safety_factor = 0.5
         else:
-            # Default guess for unknown model
-            base_memory = 10  # GB
+            # Default conservative guess for unknown model
+            base_memory = 8  # GB
         
+        is_memory_constrained = (total_memory_gb <= 8)
+        
+        if is_memory_constrained:
+            print("Detected memory-constrained system (like RK3588)")
+            # More conservative settings for constrained environments
+            safety_factor = max(0.4, safety_factor - 0.1)
+            # Increase memory efficiency assumption for systems with quantized models
+            token_memory_factor = max(6, token_memory_factor - 2)
+            
         # Calculate usable memory
-        usable_memory_gb = max(0, available_memory_gb - base_memory) * safety_factor
+        usable_memory_gb = max(0, available_memory_gb - (base_memory * 0.5)) * safety_factor
         
-        # Convert to tokens
+        # Convert to tokens (multiply by 1024^3 to convert GB to bytes)
         estimated_max_tokens = int((usable_memory_gb * 1024 * 1024 * 1024) / token_memory_factor)
         
-        # Cap at reasonable values
-        estimated_max_tokens = max(1024, min(32768, estimated_max_tokens))
+        # Cap at reasonable values - lower cap for memory-constrained systems
+        max_cap = 8192 if is_memory_constrained else 16384
+        estimated_max_tokens = max(512, min(max_cap, estimated_max_tokens))
         
-        # Round to nearest 1024
-        estimated_max_tokens = (estimated_max_tokens // 1024) * 1024
+        # Round to nearest 512 for more granular control on constrained systems
+        estimated_max_tokens = (estimated_max_tokens // 512) * 512
         
+        print(f"Model: {model_name}")
+        if model_size_gb:
+            print(f"Estimated model size: ~{model_size_gb:.1f} GB")
         print(f"Estimated maximum context length: {estimated_max_tokens} tokens")
+        
         return estimated_max_tokens
 
     def tokens_to_ctypes_array(self, tokens, ctype):
